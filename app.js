@@ -1,19 +1,25 @@
 /**
- * JUNTOS POR MAMITA - LOGICA DE NEGOCIO Y RENDERIZADO
- * Aplicación del lado del cliente para gestionar donaciones.
- * Implementa LocalStorage, compartición mediante URL Base64,
- * gráficos SVG dinámicos y un termómetro líquido interactivo.
+ * JUNTOS POR MAMITA - L\u00d3GICA DE NEGOCIO Y RENDERIZADO
+ * Aplicaci\u00f3n del lado del cliente que sincroniza datos con Supabase.
+ * Implementa persistencia compartida en la nube, suscripciones en tiempo
+ * real, gr\u00e1ficos SVG din\u00e1micos y un term\u00f3metro l\u00edquido interactivo.
+ *
+ * IMPORTANTE: Cada donante ahora se identifica con un `id` (UUID) que
+ * viene de Supabase. Ya NO se usan \u00edndices de array para editar/
+ * eliminar. Esto evita errores cuando varios usuarios escriben a la vez.
  */
 
 // ==========================================================================
-// ESTADO GLOBAL DE LA APLICACIÓN
+// ESTADO GLOBAL DE LA APLICACI\u00d3N
 // ==========================================================================
 let state = {
     goal: 3000.00,
-    donors: [], // { name: string, amount: number, date: string }
+    donors: [], // { id: string, name: string, amount: number, date: string }
     isAdmin: false,
-    adminPin: 'Mamita8080', // PIN por defecto
-    isLoaded: false // Controla la animación de entrada del termómetro
+    adminPin: 'Mamita8080', // PIN por defecto (se sobreescribe desde Supabase)
+    isLoaded: false, // Controla la animaci\u00f3n de entrada del term\u00f3metro
+    isLoading: true, // Indica si estamos cargando datos del backend
+    supabaseReady: false // True cuando Supabase est\u00e1 configurado y conectado
 };
 
 // Paleta de colores premium para los segmentos de la gráfica circular
@@ -33,37 +39,190 @@ const CHART_COLORS = [
 // ==========================================================================
 // INICIALIZACIÓN
 // ==========================================================================
-document.addEventListener('DOMContentLoaded', () => {
-    loadState();
+document.addEventListener('DOMContentLoaded', async () => {
     setupEventListeners();
+
+    // Intentamos Supabase primero. Si no está configurado, fallback a LocalStorage.
+    if (isSupabaseConfigured()) {
+        initSupabase();
+        state.supabaseReady = true;
+        await loadStateFromSupabase();
+        subscribeToSupabaseChanges();
+    } else {
+        console.warn(
+            'Supabase no configurado. Edita supabase-config.js para añadir tu URL y anon key. ' +
+            'Mientras tanto, la app cae a LocalStorage (los cambios no se comparten entre usuarios).'
+        );
+        loadStateFromLocalStorage();
+    }
 
     // Renderizamos directamente con el nivel real de progreso
     state.isLoaded = true;
+    state.isLoading = false;
     renderApp();
+
+    // El enlace "#data=..." ya no es necesario (los datos viven en el backend),
+    // pero lo revisamos por compatibilidad con enlaces viejos (legacy).
     checkUrlForSharedData();
 });
 
 // ==========================================================================
-// MANEJO DE DATOS Y COMPARTICIÓN (LOCALSTORAGE Y URL HASH)
+// CARGA Y GUARDADO DE DATOS DESDE/HAcia SUPABASE
 // ==========================================================================
 
-// Carga el estado inicial desde LocalStorage
-function loadState() {
+// Carga el estado desde Supabase (donantes + settings en una sola fila)
+async function loadStateFromSupabase() {
+    try {
+        const sb = initSupabase();
+
+        // Carga settings (meta y pin). Fila única (id=1).
+        const { data: settings, error: sErr } = await sb
+            .from(SETTINGS_TABLE)
+            .select('goal, admin_pin')
+            .eq('id', 1)
+            .maybeSingle();
+        if (sErr) throw sErr;
+        if (settings) {
+            state.goal = parseFloat(settings.goal) || 3000.00;
+            if (settings.admin_pin === 'Abuela8080') {
+                state.adminPin = 'Mamita8080';
+                await saveSettingsToSupabase(state.goal, 'Mamita8080');
+            } else {
+                state.adminPin = settings.admin_pin || 'Mamita8080';
+            }
+        }
+
+        // Carga donantes ordenados por fecha descendente.
+        const { data: donors, error: dErr } = await sb
+            .from(DONORS_TABLE)
+            .select('id, name, amount, date')
+            .order('date', { ascending: false });
+        if (dErr) throw dErr;
+
+        state.donors = (donors || []).map(d => ({
+            id: d.id,
+            name: d.name,
+            amount: parseFloat(d.amount) || 0,
+            date: d.date
+        }));
+    } catch (e) {
+        console.error('Error al cargar datos desde Supabase:', e);
+        showToast('No se pudieron cargar los datos desde el servidor.', 'error');
+        loadStateFromLocalStorage();
+    }
+}
+
+// Guarda la fila única de settings (meta y pin)
+async function saveSettingsToSupabase(newGoal, newPin) {
+    try {
+        const sb = initSupabase();
+        const { error } = await sb
+            .from(SETTINGS_TABLE)
+            .upsert({
+                id: 1,
+                goal: newGoal,
+                admin_pin: newPin,
+                updated_at: new Date().toISOString()
+            }, { onConflict: 'id' });
+        if (error) throw error;
+    } catch (e) {
+        console.error('Error al guardar settings en Supabase:', e);
+        showToast('No se pudo guardar la meta/PIN en el servidor.', 'error');
+    }
+}
+
+// ===== Suscripción en tiempo real (Realtime de Supabase) ============
+// Cada vez que alguien hace un cambio en la tabla de donantes o settings,
+// todas las pestañas abiertas reciben el evento y se refrescan solas.
+let realtimeStarted = false;
+function subscribeToSupabaseChanges() {
+    if (realtimeStarted) return;
+    realtimeStarted = true;
+    const sb = initSupabase();
+
+    sb.channel('mamita-changes')
+        .on('postgres_changes',
+            { event: '*', schema: 'public', table: DONORS_TABLE },
+            () => refreshDonorsFromSupabase()
+        )
+        .on('postgres_changes',
+            { event: '*', schema: 'public', table: SETTINGS_TABLE },
+            () => refreshSettingsFromSupabase()
+        )
+        .subscribe((status) => {
+            if (status === 'SUBSCRIBED') {
+                console.log('Suscripción en tiempo real activa.');
+            } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+                console.error('Error en la suscripción de tiempo real:', status);
+            }
+        });
+}
+
+// Recarga solo donantes desde el servidor (usado por realtime)
+async function refreshDonorsFromSupabase() {
+    try {
+        const sb = initSupabase();
+        const { data, error } = await sb
+            .from(DONORS_TABLE)
+            .select('id, name, amount, date')
+            .order('date', { ascending: false });
+        if (error) throw error;
+        state.donors = (data || []).map(d => ({
+            id: d.id,
+            name: d.name,
+            amount: parseFloat(d.amount) || 0,
+            date: d.date
+        }));
+        renderApp();
+    } catch (e) {
+        console.error('Error al refrescar donantes:', e);
+    }
+}
+
+// Recarga solo settings desde el servidor (usado por realtime)
+async function refreshSettingsFromSupabase() {
+    try {
+        const sb = initSupabase();
+        const { data, error } = await sb
+            .from(SETTINGS_TABLE)
+            .select('goal, admin_pin')
+            .eq('id', 1)
+            .maybeSingle();
+        if (error) throw error;
+        if (data) {
+            state.goal = parseFloat(data.goal) || state.goal;
+            state.adminPin = data.admin_pin || state.adminPin;
+            renderApp();
+        }
+    } catch (e) {
+        console.error('Error al refrescar settings:', e);
+    }
+}
+
+// ==========================================================================
+// FALLBACK EN LOCALSTORAGE (solo si no hay Supabase configurado)
+// ==========================================================================
+
+function loadStateFromLocalStorage() {
     const savedDonors = localStorage.getItem('mamita_donors');
     const savedGoal = localStorage.getItem('mamita_goal');
     const savedPin = localStorage.getItem('mamita_pin');
 
     if (savedDonors) {
         try {
-            state.donors = JSON.parse(savedDonors);
+            const parsed = JSON.parse(savedDonors);
+            state.donors = parsed.map(d => ({
+                id: d.id || ('local_' + Math.random().toString(36).slice(2)),
+                name: d.name,
+                amount: parseFloat(d.amount) || 0,
+                date: d.date || new Date().toISOString()
+            }));
         } catch (e) {
             console.error('Error al cargar donantes de LocalStorage', e);
             state.donors = [];
         }
     }
-    if (savedGoal) {
-        state.goal = parseFloat(savedGoal) || 3000.00;
-    }
+    if (savedGoal) state.goal = parseFloat(savedGoal) || 3000.00;
     if (savedPin) {
         if (savedPin === 'Abuela8080') {
             state.adminPin = 'Mamita8080';
@@ -74,65 +233,82 @@ function loadState() {
     }
 }
 
-// Guarda el estado actual en LocalStorage
 function saveStateToLocalStorage() {
-    localStorage.setItem('mamita_donors', JSON.stringify(state.donors));
+    const lean = state.donors.map(d => ({
+        name: d.name, amount: d.amount, date: d.date
+    }));
+    localStorage.setItem('mamita_donors', JSON.stringify(lean));
     localStorage.setItem('mamita_goal', state.goal.toString());
     localStorage.setItem('mamita_pin', state.adminPin);
 }
 
-// Verifica si la URL tiene datos compartidos codificados
+// Verifica si la URL tiene datos compartidos codificados (LEGACY).
+// En modo Supabase esta función ya no sobreescribe el estado porque los
+// datos "de verdad" viven en el backend. Solo se usa como fallback offline.
 function checkUrlForSharedData() {
     const hash = window.location.hash;
-    if (hash && hash.startsWith('#data=')) {
-        const base64Data = hash.substring(6);
-        try {
-            // Decodifica Base64 manejando caracteres especiales utf-8 de forma segura
-            const jsonString = decodeURIComponent(escape(atob(base64Data)));
-            const decodedData = JSON.parse(jsonString);
+    if (!hash || !hash.startsWith('#data=')) return;
 
-            if (decodedData.donors && Array.isArray(decodedData.donors)) {
-                state.donors = decodedData.donors;
-                state.goal = parseFloat(decodedData.goal) || 3000.00;
+    // En modo Supabase, simplemente limpiamos el hash viejo y avisamos.
+    if (state.supabaseReady) {
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+        showToast('Los datos se cargan automáticamente desde el servidor.', 'info');
+        return;
+    }
 
-                showToast('Datos cargados correctamente desde el enlace compartido.', 'success');
-                renderApp();
+    const base64Data = hash.substring(6);
+    try {
+        const jsonString = decodeURIComponent(escape(atob(base64Data)));
+        const decodedData = JSON.parse(jsonString);
 
-                // Si la información es diferente de lo que tenemos localmente,
-                // avisamos que pueden guardar estos datos localmente si entran en modo administrador
-                const localDonors = localStorage.getItem('mamita_donors');
-                if (localDonors && localDonors !== JSON.stringify(state.donors)) {
-                    showToast('Estás viendo una versión compartida. Los cambios que hagas no afectarán tu base de datos local a menos que la guardes.', 'info');
-                }
-            }
-        } catch (e) {
-            console.error('Error al decodificar datos de la URL:', e);
-            showToast('El enlace compartido no es válido o está corrupto.', 'error');
+        if (decodedData.donors && Array.isArray(decodedData.donors)) {
+            state.donors = decodedData.donors.map(d => ({
+                id: d.id || ('local_' + Math.random().toString(36).slice(2)),
+                name: d.name,
+                amount: parseFloat(d.amount) || 0,
+                date: d.date || new Date().toISOString()
+            }));
+            state.goal = parseFloat(decodedData.goal) || 3000.00;
+
+            showToast('Datos cargados desde el enlace compartido (modo offline).', 'success');
+            renderApp();
         }
+    } catch (e) {
+        console.error('Error al decodificar datos de la URL:', e);
+        showToast('El enlace compartido no es válido o está corrupto.', 'error');
     }
 }
 
 // Genera y copia el enlace para compartir la información actual
 function generateShareLink() {
     try {
+        // En modo Supabase, basta con compartir la URL limpia: todos ven lo
+        // mismo porque los datos viven en el backend.
+        if (state.supabaseReady) {
+            const cleanUrl = window.location.origin + window.location.pathname;
+            navigator.clipboard.writeText(cleanUrl).then(() => {
+                showToast('¡Enlace copiado! Cualquiera que lo abra verá los donantes actualizados.', 'success');
+            }).catch(err => {
+                console.error('Error al copiar enlace:', err);
+                showToast('No se pudo copiar el enlace. Cópielo manualmente: ' + cleanUrl, 'error');
+            });
+            return;
+        }
+
+        // Modo fallback (LocalStorage): codifica todo en Base64 como antes.
         const dataToEncode = {
             goal: state.goal,
-            donors: state.donors
+            donors: state.donors.map(d => ({ name: d.name, amount: d.amount, date: d.date }))
         };
-        // Codifica a Base64 manejando caracteres especiales utf-8 de forma segura
         const jsonString = JSON.stringify(dataToEncode);
         const base64Data = btoa(unescape(encodeURIComponent(jsonString)));
-
-        // Crea la URL limpia sin otros hashes
         const baseUrl = window.location.origin + window.location.pathname;
         const shareUrl = `${baseUrl}#data=${base64Data}`;
 
-        // Copia al portapapeles
         navigator.clipboard.writeText(shareUrl).then(() => {
             showToast('¡Enlace copiado al portapapeles! Compártelo con los donantes.', 'success');
         }).catch(err => {
             console.error('Error al copiar enlace:', err);
-            // Fallback si no funciona el portapapeles directo (p.ej. navegadores antiguos)
             const inputTemp = document.createElement('input');
             inputTemp.value = shareUrl;
             document.body.appendChild(inputTemp);
@@ -148,74 +324,132 @@ function generateShareLink() {
 }
 
 // ==========================================================================
-// LOGICA DE NEGOCIO (AGREGAR, EDITAR, SUMAR Y ELIMINAR DONANTES)
+// LÓGICA DE NEGOCIO (AGREGAR, EDITAR, SUMAR Y ELIMINAR DONANTES)
 // ==========================================================================
+// En modo Supabase, cada operación hace INSERT/UPDATE/DELETE en la nube.
+// El refresco visual lo dispara la suscripción en tiempo real (refreshDonorsFromSupabase),
+// pero hacemos un render local optimista para que la UI se vea fluida.
 
 /**
  * Agrega una nueva donación o suma a una existente.
  * @param {string} name - Nombre del donante
  * @param {number} amount - Cantidad donada
  */
-function handleAddOrUpdateDonation(name, amount) {
+async function handleAddOrUpdateDonation(name, amount) {
     name = name.trim();
     if (!name || isNaN(amount) || amount <= 0) return;
 
-    // Buscar si el donante ya existe (sin importar mayúsculas/minúsculas y espacios extra)
-    const existingDonorIndex = state.donors.findIndex(
+    // Buscar si el donante ya existe (sin importar mayúsculas/minúsculas y espacios)
+    const existingDonor = state.donors.find(
         d => d.name.toLowerCase().replace(/\s+/g, '') === name.toLowerCase().replace(/\s+/g, '')
     );
 
-    if (existingDonorIndex !== -1) {
-        // El donante ya existe. Sumar cantidad
-        const originalAmount = state.donors[existingDonorIndex].amount;
-        state.donors[existingDonorIndex].amount += amount;
-        state.donors[existingDonorIndex].date = new Date().toISOString(); // Actualiza fecha de última aportación
-
-        showToast(`Se han sumado $${amount.toFixed(2)} a ${state.donors[existingDonorIndex].name}. Nuevo total: $${state.donors[existingDonorIndex].amount.toFixed(2)}`, 'success');
+    if (existingDonor) {
+        if (state.supabaseReady && existingDonor.id) {
+            const newAmount = (parseFloat(existingDonor.amount) || 0) + amount;
+            const { error } = await initSupabase()
+                .from(DONORS_TABLE)
+                .update({
+                    amount: newAmount,
+                    date: new Date().toISOString()
+                })
+                .eq('id', existingDonor.id);
+            if (error) {
+                console.error('Error al sumar en Supabase:', error);
+                showToast('No se pudo actualizar el donante en el servidor.', 'error');
+                return;
+            }
+            // Actualiza localmente para visual inmediato (realtime confirmará)
+            existingDonor.amount = newAmount;
+            existingDonor.date = new Date().toISOString();
+        } else {
+            existingDonor.amount += amount;
+            existingDonor.date = new Date().toISOString();
+            saveStateToLocalStorage();
+        }
+        showToast(`Se han sumado $${amount.toFixed(2)} a ${existingDonor.name}. Nuevo total: $${existingDonor.amount.toFixed(2)}`, 'success');
+        renderApp();
     } else {
         // Nuevo donante
-        state.donors.push({
-            name: name,
-            amount: amount,
-            date: new Date().toISOString()
-        });
+        const newDate = new Date().toISOString();
+        if (state.supabaseReady) {
+            const { data, error } = await initSupabase()
+                .from(DONORS_TABLE)
+                .insert([{ name: name, amount: amount, date: newDate }])
+                .select('id');
+            if (error) {
+                console.error('Error al insertar donante en Supabase:', error);
+                showToast('No se pudo registrar el donante en el servidor.', 'error');
+                return;
+            }
+            state.donors.unshift({
+                id: data[0].id, name: name, amount: amount, date: newDate
+            });
+        } else {
+            state.donors.push({
+                id: 'local_' + Math.random().toString(36).slice(2),
+                name: name, amount: amount, date: newDate
+            });
+            saveStateToLocalStorage();
+        }
         showToast(`Se ha registrado la donación de ${name} por $${amount.toFixed(2)}`, 'success');
+        renderApp();
     }
-
-    saveStateToLocalStorage();
-    renderApp();
 }
 
 /**
- * Añade fondos de manera rápida a un donante específico por su índice
- * @param {number} index - Índice en el array global
+ * Añade fondos de manera rápida a un donante específico por su id (UUID).
+ * @param {string} donorId - id del donante (UUID en Supabase)
  * @param {number} extraAmount - Cantidad extra a sumar
  */
-function quickAddFunds(index, extraAmount) {
-    if (index < 0 || index >= state.donors.length || isNaN(extraAmount) || extraAmount <= 0) return;
+async function quickAddFunds(donorId, extraAmount) {
+    const donor = state.donors.find(d => d.id === donorId);
+    if (!donor || isNaN(extraAmount) || extraAmount <= 0) return;
 
-    const donor = state.donors[index];
-    donor.amount += extraAmount;
-    donor.date = new Date().toISOString();
+    const newAmount = (parseFloat(donor.amount) || 0) + extraAmount;
+    const newDate = new Date().toISOString();
 
+    if (state.supabaseReady) {
+        const { error } = await initSupabase()
+            .from(DONORS_TABLE)
+            .update({ amount: newAmount, date: newDate })
+            .eq('id', donor.id);
+        if (error) {
+            console.error('Error al sumar fondos en Supabase:', error);
+            showToast('No se pudo añadir el dinero en el servidor.', 'error');
+            return;
+        }
+    } else {
+        saveStateToLocalStorage();
+    }
+    donor.amount = newAmount;
+    donor.date = newDate;
     showToast(`Se sumaron $${extraAmount.toFixed(2)} a ${donor.name}. Total: $${donor.amount.toFixed(2)}`, 'success');
-
-    saveStateToLocalStorage();
     renderApp();
 }
 
 /**
- * Elimina una donación
- * @param {number} index - Índice del donante a eliminar
+ * Elimina una donación por id (UUID).
+ * @param {string} donorId - id del donante
  */
-function deleteDonation(index) {
-    if (index < 0 || index >= state.donors.length) return;
+async function deleteDonation(donorId) {
+    const donor = state.donors.find(d => d.id === donorId);
+    if (!donor) return;
 
-    const name = state.donors[index].name;
-    state.donors.splice(index, 1);
-    showToast(`Se eliminó el registro de donaciones de ${name}`, 'info');
-
-    saveStateToLocalStorage();
+    if (state.supabaseReady) {
+        const { error } = await initSupabase()
+            .from(DONORS_TABLE)
+            .delete()
+            .eq('id', donor.id);
+        if (error) {
+            console.error('Error al eliminar en Supabase:', error);
+            showToast('No se pudo eliminar el donante del servidor.', 'error');
+            return;
+        }
+    }
+    state.donors = state.donors.filter(d => d.id !== donorId);
+    if (!state.supabaseReady) saveStateToLocalStorage();
+    showToast(`Se eliminó el registro de donaciones de ${donor.name}`, 'info');
     renderApp();
 }
 
@@ -223,10 +457,14 @@ function deleteDonation(index) {
  * Modifica la meta de recaudación
  * @param {number} newGoal - Nuevo monto meta
  */
-function updateGoal(newGoal) {
+async function updateGoal(newGoal) {
     if (isNaN(newGoal) || newGoal <= 0) return;
     state.goal = newGoal;
-    saveStateToLocalStorage();
+    if (state.supabaseReady) {
+        await saveSettingsToSupabase(state.goal, state.adminPin);
+    } else {
+        saveStateToLocalStorage();
+    }
     renderApp();
     showToast(`La meta se ha ajustado a $${newGoal.toFixed(2)}`, 'success');
 }
@@ -234,10 +472,23 @@ function updateGoal(newGoal) {
 /**
  * Borra toda la base de datos de donaciones (con confirmación de seguridad)
  */
-function resetAllData() {
+async function resetAllData() {
     if (confirm('¿Estás seguro de que deseas borrar TODAS las donaciones registradas? Esta acción no se puede deshacer.')) {
+        if (state.supabaseReady) {
+            // Borra todos los donantes del backend
+            const { error } = await initSupabase()
+                .from(DONORS_TABLE)
+                .delete()
+                .neq('id', '00000000-0000-0000-0000-000000000000'); // truco para borrar todo
+            if (error) {
+                console.error('Error al borrar todos los donantes en Supabase:', error);
+                showToast('No se pudieron borrar los datos del servidor.', 'error');
+                return;
+            }
+        } else {
+            saveStateToLocalStorage();
+        }
         state.donors = [];
-        saveStateToLocalStorage();
         renderApp();
         showToast('Se han eliminado todos los datos correctamente.', 'info');
     }
@@ -301,7 +552,7 @@ function renderDonorsList() {
     const sortBy = document.getElementById('sort-by').value;
 
     // Filtrar donantes por búsqueda
-    let filteredDonors = state.donors.map((d, index) => ({ ...d, originalIndex: index }));
+    let filteredDonors = state.donors.map(d => ({ ...d }));
     if (searchVal) {
         filteredDonors = filteredDonors.filter(d => d.name.toLowerCase().includes(searchVal));
     }
@@ -345,8 +596,12 @@ function renderDonorsList() {
         const dateObj = new Date(donor.date);
         const formattedDate = dateObj.toLocaleDateString('es-ES', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 
+        // IMPORTANTE: pasamos el id (UUID string) escapado con comillas simples.
+        // Ya no usamos índices numéricos porque los ids pueden cambiar tras recargas.
+        const safeId = String(donor.id).replace(/'/g, "\\'");
+
         html += `
-            <div class="donor-card" data-index="${donor.originalIndex}">
+            <div class="donor-card" data-id="${donor.id}">
                 <div class="donor-info">
                     <div class="donor-avatar" style="${avatarStyle}">${initials}</div>
                     <div class="donor-meta">
@@ -365,13 +620,13 @@ function renderDonorsList() {
                     
                     ${state.isAdmin ? `
                         <div class="admin-actions-cell">
-                            <button class="btn-action btn-action-add" onclick="openQuickAddModal(${donor.originalIndex})" title="Agregar más dinero">
+                            <button class="btn-action btn-action-add" onclick="openQuickAddModal('${safeId}')" title="Agregar más dinero">
                                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
                             </button>
-                            <button class="btn-action btn-action-edit" onclick="editDonorForm(${donor.originalIndex})" title="Editar registro">
+                            <button class="btn-action btn-action-edit" onclick="editDonorForm('${safeId}')" title="Editar registro">
                                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                             </button>
-                            <button class="btn-action btn-action-delete" onclick="deleteDonation(${donor.originalIndex})" title="Eliminar registro">
+                            <button class="btn-action btn-action-delete" onclick="deleteDonation('${safeId}')" title="Eliminar registro">
                                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                             </button>
                         </div>
@@ -520,34 +775,56 @@ function setupEventListeners() {
     document.getElementById('btn-share-link').addEventListener('click', generateShareLink);
 
     // 3. Panel de Administrador - Guardar donación
-    document.getElementById('form-donation').addEventListener('submit', (e) => {
+    document.getElementById('form-donation').addEventListener('submit', async (e) => {
         e.preventDefault();
-        const editIdx = document.getElementById('edit-donor-index').value;
+        const editId = document.getElementById('edit-donor-index').value;
         const nameInput = document.getElementById('input-donor-name');
         const amountInput = document.getElementById('input-amount');
 
         const name = nameInput.value;
         const amount = parseFloat(amountInput.value);
 
-        if (editIdx !== '') {
-            // Caso Edición Directa completa de un registro
-            const index = parseInt(editIdx);
-            const originalName = state.donors[index].name;
-            state.donors[index].name = name.trim();
-            state.donors[index].amount = amount;
+        if (editId !== '') {
+            // Caso Edición Directa completa de un registro (por id UUID)
+            const donor = state.donors.find(d => d.id === editId);
+            if (!donor) {
+                showToast('No se encontró el donante a editar. Puede que fue borrado.', 'error');
+                document.getElementById('edit-donor-index').value = '';
+                document.getElementById('btn-submit-text').textContent = 'Guardar Donación';
+                document.getElementById('btn-cancel-edit').classList.add('hidden');
+                e.target.reset();
+                return;
+            }
+            const originalName = donor.name;
+            donor.name = name.trim();
+            donor.amount = amount;
+            donor.date = new Date().toISOString();
 
-            showToast(`Se ha modificado el registro de ${originalName}`, 'success');
+            if (state.supabaseReady) {
+                const { error } = await initSupabase()
+                    .from(DONORS_TABLE)
+                    .update({ name: donor.name, amount: donor.amount, date: donor.date })
+                    .eq('id', donor.id);
+                if (error) {
+                    console.error('Error al editar donante en Supabase:', error);
+                    showToast('No se pudo guardar el cambio en el servidor.', 'error');
+                } else {
+                    showToast(`Se ha modificado el registro de ${originalName}`, 'success');
+                }
+            } else {
+                saveStateToLocalStorage();
+                showToast(`Se ha modificado el registro de ${originalName}`, 'success');
+            }
 
             // Limpiar modo edición
             document.getElementById('edit-donor-index').value = '';
             document.getElementById('btn-submit-text').textContent = 'Guardar Donación';
             document.getElementById('btn-cancel-edit').classList.add('hidden');
 
-            saveStateToLocalStorage();
             renderApp();
         } else {
             // Caso Registro/Suma Normal
-            handleAddOrUpdateDonation(name, amount);
+            await handleAddOrUpdateDonation(name, amount);
         }
 
         e.target.reset();
@@ -662,7 +939,7 @@ function verifyAdminPin() {
 }
 
 // Cambia el PIN de administrador
-function handleChangePin() {
+async function handleChangePin() {
     const newPin = document.getElementById('input-new-pin').value;
     const confirmPin = document.getElementById('input-confirm-pin').value;
     const errorEl = document.getElementById('change-pin-error');
@@ -686,7 +963,11 @@ function handleChangePin() {
     }
 
     state.adminPin = newPin;
-    saveStateToLocalStorage();
+    if (state.supabaseReady) {
+        await saveSettingsToSupabase(state.goal, newPin);
+    } else {
+        saveStateToLocalStorage();
+    }
     closeModal('modal-change-pin');
     showToast('¡El código PIN ha sido cambiado con éxito!', 'success');
 }
@@ -702,13 +983,13 @@ function closeModal(id) {
 }
 
 // Rellena el formulario con los datos de un donante para edición directa
-function editDonorForm(index) {
-    if (index < 0 || index >= state.donors.length) return;
-    const donor = state.donors[index];
+function editDonorForm(donorId) {
+    const donor = state.donors.find(d => d.id === donorId);
+    if (!donor) return;
 
     document.getElementById('input-donor-name').value = donor.name;
     document.getElementById('input-amount').value = donor.amount;
-    document.getElementById('edit-donor-index').value = index;
+    document.getElementById('edit-donor-index').value = donor.id;
 
     document.getElementById('btn-submit-text').textContent = 'Actualizar Registro';
     document.getElementById('btn-cancel-edit').classList.remove('hidden');
@@ -718,11 +999,11 @@ function editDonorForm(index) {
 }
 
 // Abre el modal rápido para añadir más dinero a un donante específico
-function openQuickAddModal(index) {
-    if (index < 0 || index >= state.donors.length) return;
-    const donor = state.donors[index];
+function openQuickAddModal(donorId) {
+    const donor = state.donors.find(d => d.id === donorId);
+    if (!donor) return;
 
-    document.getElementById('quick-donor-index').value = index;
+    document.getElementById('quick-donor-index').value = donor.id;
     document.getElementById('quick-donor-name').textContent = donor.name;
 
     const formatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
@@ -738,12 +1019,12 @@ function openQuickAddModal(index) {
 }
 
 // Envía la suma rápida del modal
-function handleQuickFundsSubmit() {
-    const idx = parseInt(document.getElementById('quick-donor-index').value);
+async function handleQuickFundsSubmit() {
+    const donorId = document.getElementById('quick-donor-index').value;
     const amount = parseFloat(document.getElementById('input-quick-amount').value);
 
     if (amount > 0) {
-        quickAddFunds(idx, amount);
+        await quickAddFunds(donorId, amount);
         closeModal('modal-add-funds');
     } else {
         showToast('El monto introducido debe ser mayor que 0.', 'error');
